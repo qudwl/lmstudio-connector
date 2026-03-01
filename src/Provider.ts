@@ -11,13 +11,70 @@ import {
   ProvideLanguageModelChatResponseOptions,
   Uri,
   workspace,
+  Disposable,
 } from "vscode";
 
 import { toAbortSignal } from "./utils";
 import { Chat, LMStudioClient } from "@lmstudio/sdk";
 
+function getLMStudioConfig() {
+  const config = workspace.getConfiguration("lmstudioConnector");
+  return {
+    port: config.get<number>("port", 1234),
+    apiKey: config.get<string>("apiKey", ""),
+  };
+}
+
 export class LMSConnectorProvider implements LanguageModelChatProvider {
-  client = new LMStudioClient();
+  private client: LMStudioClient;
+  private configListener: Disposable;
+  private modelCache = new Map<
+    string,
+    Awaited<ReturnType<typeof this.client.llm.model>>
+  >();
+
+  constructor() {
+    this.client = this.createClient();
+
+    this.configListener = workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("lmstudioConnector")) {
+        this.client = this.createClient();
+        console.log("LM Studio client reloaded due to config change.");
+      }
+    });
+  }
+
+  /**
+   * Creates a new LMStudioClient instance based on current configuration.
+   *
+   * @returns an instance of LMStudioClient connected to the specified LM Studio WebSocket API.
+   */
+  private createClient(): LMStudioClient {
+    const config = workspace.getConfiguration("lmstudioConnector");
+    const port = config.get<number>("port", 1234);
+    const apiKey = config.get<string>("apiKey", "");
+    return new LMStudioClient({
+      baseUrl: `ws://127.0.0.1:${port}`,
+      ...(apiKey ? { apiKey } : {}),
+    });
+  }
+
+  private async getModel(modelId: string) {
+    if (this.modelCache.has(modelId)) {
+      return this.modelCache.get(modelId)!;
+    }
+    const model = await this.client.llm.model(modelId);
+    this.modelCache.set(modelId, model);
+    return model;
+  }
+
+  /**
+   * Provides a list of available language models from LM Studio.
+   *
+   * @param options Language model preparation options, including whether to operate in silent mode.
+   * @param token Cancellation token to handle request cancellation.
+   * @returns A promise that resolves to an array of LanguageModelChatInformation objects representing available models.
+   */
   async provideLanguageModelChatInformation(
     options: PrepareLanguageModelChatModelOptions,
     token: CancellationToken,
@@ -111,9 +168,10 @@ export class LMSConnectorProvider implements LanguageModelChatProvider {
     token: CancellationToken,
   ): Promise<void> {
     const { signal, disposable } = toAbortSignal(token);
+    const client = this.client;
 
     try {
-      const loadedModel = await this.client.llm.model(model.id);
+      const loadedModel = await this.getModel(model.id);
 
       if (!loadedModel) {
         throw new Error(`Failed to load model: ${model.id}`);
@@ -184,7 +242,7 @@ export class LMSConnectorProvider implements LanguageModelChatProvider {
     // 3. Try to use SDK (Async) or Fallback
     try {
       // We must await this because the SDK is network-based
-      const loadedModel = await this.client.llm.model(model.id);
+      const loadedModel = await this.getModel(model.id);
 
       if (loadedModel.countTokens) {
         return await loadedModel.countTokens(contentToCount);
